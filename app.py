@@ -235,4 +235,4 @@ with tab3:
 
         fig_b = px.bar(dr, x="Ludność", y="Etykieta", orientation="h", color="Ludność", text="Ludność")
         fig_b.update_layout(yaxis=dict(autorange="reversed", title=""), coloraxis_showscale=False, height=max(400, top_n * 25))
-        st.plotly_chart(fig_b, use_contain
+        st.plotly_chart(fig_b, use_container_width=True)
