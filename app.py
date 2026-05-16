@@ -55,7 +55,7 @@ def is_foreign_city(name):
 
 
 def parse_year(text):
-    if pd.isna(text) or str(text).strip() == '':
+    if pd.isna(text) or str(text).strip() in ('', 'nan', 'None'):
         return None, False
     
     orig = str(text).replace('\xa0', ' ').strip()
@@ -63,17 +63,20 @@ def parse_year(text):
     # Wykrywanie "około" / "ok." / "ok" / "~"
     is_approx = bool(re.search(r'(?i)(około|ok\.|ok|~)', orig))
 
+    # Sklejanie cyfr przedzielonych spacją, np. "1 400" -> "1400"
+    orig_fixed = re.sub(r'(?<=\d)\s+(?=\d)', '', orig)
+
     # 1. Próba znalezienia formatu DD.MM.YYYY
-    dm = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{3,4})', orig)
+    dm = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{3,4})', orig_fixed)
     if dm:
         yr = int(dm.group(3))
         if 800 <= yr <= 2100:
             return yr, is_approx
 
-    # 2. Szukanie dowolnej liczby 3 lub 4 cyfrowej (800-2100)
-    numbers = re.findall(r'\d{3,4}', orig)
+    # 2. Szukanie jakiejkolwiek innej liczby 3 lub 4 cyfrowej (800-2100)
+    numbers = re.findall(r'\d{3,4}', orig_fixed)
     if numbers:
-        for n in reversed(numbers): 
+        for n in numbers: 
             yr = int(n)
             if 800 <= yr <= 2100:
                 return yr, is_approx
@@ -113,12 +116,18 @@ def load_warsaw_cities():
 @st.cache_data(ttl=3600)
 def load_data():
     df = pd.read_csv(CSV_URL, header=None, dtype=str)
-    date_row = df.iloc[0].tolist()
     col_to_year, col_to_approx = {}, {}
     
-    for i, val in enumerate(date_row):
-        if i == 0: continue
-        yr, approx = parse_year(val)
+    # Przeszukujemy pierwsze DWA wiersze - czasem daty "uciekają" z nagłówków w dół
+    for i in range(1, len(df.columns)):
+        val0 = str(df.iloc[0, i])
+        yr, approx = parse_year(val0)
+        
+        # Jeżeli w 1. wierszu nie było daty, spróbujmy w 2.
+        if yr is None and len(df) > 1:
+            val1 = str(df.iloc[1, i])
+            yr, approx = parse_year(val1)
+            
         if yr is not None:
             col_to_year[i] = yr
             col_to_approx[i] = approx
@@ -127,54 +136,67 @@ def load_data():
     for row_idx in range(1, len(df)):
         row = df.iloc[row_idx].tolist()
         city = str(row[0]).strip()
-        if not city or city == 'nan' or city in AGGREGATE_CITIES or is_przypis(city):
+        
+        # Odrzucamy wiersze które ewidentnie nie są miastami
+        if not city or city in ('nan', 'None') or city in AGGREGATE_CITIES or is_przypis(city):
             continue
             
         for col_idx, year in col_to_year.items():
             if col_idx >= len(row): continue
             
             raw = str(row[col_idx]).strip()
-            if raw in ('', 'nan'): continue
+            if raw in ('', 'nan', 'None'): continue
             
-            # --- Agresywne czyszczenie wartości ludności ---
-            # 1. Usuń przypisy w nawiasach kwadratowych np. [1]
+            # 1. Usuń przypisy [1] z danych o ludności
             raw_clean = re.sub(r'\[.*?\]', '', raw)
-            # 2. Usuń wyrazy takie jak ok., około, ~
-            raw_clean = re.sub(r'(?i)(około|ok\.|ok|~)', '', raw_clean)
-            # 3. Usuń spacje (np. 1 500 -> 1500)
-            raw_clean = re.sub(r'\s+', '', raw_clean)
-            # 4. Zamień przecinki na kropki
-            raw_clean = raw_clean.replace(',', '.')
-            # 5. Zostaw wyłącznie cyfry i ewentualne kropki dziesiętne
-            raw_clean = re.sub(r'[^\d\.]', '', raw_clean)
             
-            try:
-                if raw_clean:
-                    val = int(float(raw_clean))
-                    records.append({
-                        "Miasto": city, "Rok": year,
-                        "Approx": col_to_approx[col_idx],
-                        "Ludność": val,
-                        "Zagraniczne": is_foreign_city(city),
-                    })
-            except ValueError:
-                pass
+            # 2. Sprawdzenie skrótów tysięcy i milionów przed usunięciem liter
+            is_tys = bool(re.search(r'(?i)tys', raw_clean))
+            is_mln = bool(re.search(r'(?i)mln', raw_clean))
+            
+            # 3. Usuwamy spacje i twarde spacje, żeby np "1 500" stało się "1500"
+            no_spaces = raw_clean.replace(' ', '').replace('\xa0', '')
+            
+            # 4. Wyciągamy pierwszą napotkaną pełną liczbę (nawet jeśli to zakres np. 1000-1500, weźmie 1000)
+            match = re.search(r'(\d+([\.,]\d+)?)', no_spaces)
+            if match:
+                num_str = match.group(1).replace(',', '.')
+                try:
+                    val = float(num_str)
+                    
+                    if is_tys:
+                        val *= 1000
+                    if is_mln:
+                        val *= 1000000
+                        
+                    val = int(val)
+                    
+                    if val > 0:
+                        records.append({
+                            "Miasto": city, "Rok": year,
+                            "Approx": col_to_approx[col_idx],
+                            "Ludność": val,
+                            "Zagraniczne": is_foreign_city(city),
+                        })
+                except ValueError:
+                    pass
 
     df_long = pd.DataFrame(records)
     if df_long.empty:
-        return df_long, date_row
+        # Zabezpieczenie przed błędem, gdyby mimo starań nic się nie wczytało
+        return df_long, []
         
     df_long["Rok_Label"] = df_long.apply(
         lambda r: f"~{r['Rok']}" if r["Approx"] else str(r["Rok"]), axis=1
     )
-    return df_long.sort_values(["Miasto", "Rok"]), date_row
+    return df_long.sort_values(["Miasto", "Rok"]), []
 
 
 # --- STREAMLIT UI ---
 
 st.title("🏙️ Ludność miast Polski na przestrzeni wieków")
 
-with st.spinner("Ładowanie danych..."):
+with st.spinner("Ładowanie danych... (może to zająć kilka sekund)"):
     try:
         df, _date_row = load_data()
         warsaw_cities = load_warsaw_cities()
@@ -185,7 +207,7 @@ with st.spinner("Ładowanie danych..."):
         st.stop()
 
 if df.empty:
-    st.error("Brak danych do wyświetlenia.")
+    st.error("Brak danych do wyświetlenia. Arkusz może nie zawierać odczytywalnych dat lub miast.")
     st.stop()
 
 df_pl = df[~df["Zagraniczne"]].copy()
@@ -259,9 +281,17 @@ with tab2:
         if rank_records:
             df_plot_ranks = pd.concat(rank_records)
             df_plot_ranks = df_plot_ranks[df_plot_ranks["Miasto"].isin(selected)]
-            fig_r = px.line(df_plot_ranks, x="Rok_Wykresu", y="Pozycja", color="Miasto", markers=True)
-            fig_r.update_layout(yaxis=dict(autorange="reversed"), height=600)
-            st.plotly_chart(fig_r, use_container_width=True)
+            
+            if not df_plot_ranks.empty:
+                fig_r = px.line(df_plot_ranks, x="Rok_Wykresu", y="Pozycja", color="Miasto", markers=True)
+                fig_r.update_layout(yaxis=dict(autorange="reversed"), height=600)
+                st.plotly_chart(fig_r, use_container_width=True)
+            else:
+                 st.info("Brak punktów danych do wyrysowania w danym przedziale / z wybraną tolerancją.")
+        else:
+            st.info("Brak danych.")
+    else:
+        st.info("Wybierz miasta powyżej.")
 
 # --- TAB 3 ---
 with tab3:
@@ -281,3 +311,5 @@ with tab3:
             st.plotly_chart(fig_b, use_container_width=True)
         else:
             st.info("Brak danych w wybranym przedziale.")
+    else:
+        st.info("Wybierz miasta powyżej.")
